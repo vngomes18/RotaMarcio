@@ -7,8 +7,16 @@ from geopy.geocoders import Nominatim, GoogleV3
 from geopy.extra.rate_limiter import RateLimiter
 import json
 import random
+import os
+import urllib.request
+import urllib.error
 
-app = Flask(__name__)
+# Diretórios de templates e estáticos relativos ao arquivo atual
+base_dir = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+template_dir = os.path.join(base_dir, 'templates')
+static_dir = os.path.join(base_dir, 'static')
+
+app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
 
 # Configurações
 cidade_atual = "Maricá, Rio de Janeiro, Brazil"
@@ -20,6 +28,7 @@ geolocator = Nominatim(user_agent="marica_routes_app_v2")
 
 # Rate limiter para evitar bloqueios
 geocode_com_rate_limit = RateLimiter(geolocator.geocode, min_delay_seconds=0.5)
+reverse_geocode_com_rate_limit = RateLimiter(geolocator.reverse, min_delay_seconds=0.5)
 
 def inicializar_sistema():
     """Inicializa o sistema com Maricá"""
@@ -224,10 +233,25 @@ def obter_rota_por_geometria(origem_no, destino_no):
 def calcular_rota_entre_pontos(origem_lat, origem_lng, destino_lat, destino_lng, modo='driving'):
     """Calcula rota entre dois pontos usando Dijkstra"""
     try:
-        # Encontrar nós mais próximos das coordenadas
-        origem_no = ox.nearest_nodes(grafo, origem_lng, origem_lat)
-        destino_no = ox.nearest_nodes(grafo, destino_lng, destino_lat)
-        
+        # Encontrar nós mais próximos das coordenadas (com projeção quando disponível)
+        try:
+            if grafo_proj is not None:
+                from shapely.geometry import Point
+                p_origem = Point(origem_lng, origem_lat)
+                p_destino = Point(destino_lng, destino_lat)
+                p_origem_proj, _ = ox.projection.project_geometry(p_origem, to_crs=grafo_proj.graph.get('crs'))
+                p_destino_proj, _ = ox.projection.project_geometry(p_destino, to_crs=grafo_proj.graph.get('crs'))
+                origem_no = ox.nearest_nodes(grafo_proj, p_origem_proj.x, p_origem_proj.y)
+                destino_no = ox.nearest_nodes(grafo_proj, p_destino_proj.x, p_destino_proj.y)
+            else:
+                origem_no = ox.nearest_nodes(grafo, origem_lng, origem_lat)
+                destino_no = ox.nearest_nodes(grafo, destino_lng, destino_lat)
+        except Exception as e:
+            return {'sucesso': False, 'erro': f'Erro ao encontrar nos mais proximos: {str(e)}'}
+
+        if origem_no is None or destino_no is None:
+            return {'sucesso': False, 'erro': 'Nao foi possivel encontrar nos validos para as coordenadas fornecidas'}
+
         # Usar a função de geometria para obter rota precisa
         resultado = obter_rota_por_geometria(origem_no, destino_no)
         
@@ -243,6 +267,8 @@ def calcular_rota_entre_pontos(origem_lat, origem_lng, destino_lat, destino_lng,
             return {'sucesso': False, 'erro': resultado.get('erro', 'Erro desconhecido')}
             
     except Exception as e:
+        import traceback
+        print(f"Erro completo ao calcular rota: {traceback.format_exc()}")
         return {'sucesso': False, 'erro': f'Erro ao calcular rota: {str(e)}'}
 
 @app.route('/')
@@ -259,6 +285,16 @@ def api_buscar_endereco():
         
         if not query:
             return jsonify({'error': 'Query não fornecida'})
+        
+        # Tentar identificar coordenadas "lat, lng" e fazer reverse geocoding
+        try:
+            partes = query.split(',')
+            if len(partes) == 2:
+                lat = float(partes[0].strip())
+                lng = float(partes[1].strip())
+                return api_reverse_geocode(lat, lng)
+        except (ValueError, AttributeError):
+            pass
         
         # Adicionar "Maricá RJ" à busca para melhor precisão
         query_completa = f"{query}, Maricá, Rio de Janeiro, Brazil"
@@ -286,6 +322,36 @@ def api_buscar_endereco():
             'sucesso': False,
             'mensagem': f'Erro ao buscar endereço: {str(e)}'
         })
+
+@app.route('/api/reverse_geocode', methods=['POST'])
+def api_reverse_geocode_route():
+    """Faz reverse geocoding (coordenadas -> endereço)"""
+    try:
+        dados = request.json
+        lat = dados.get('lat')
+        lng = dados.get('lng')
+        
+        if lat is None or lng is None:
+            return jsonify({'sucesso': False, 'mensagem': 'Coordenadas não fornecidas'})
+        
+        return api_reverse_geocode(float(lat), float(lng))
+    except Exception as e:
+        return jsonify({'sucesso': False, 'mensagem': f'Erro ao fazer reverse geocoding: {str(e)}'})
+
+def api_reverse_geocode(lat, lng):
+    """Função auxiliar para reverse geocoding"""
+    try:
+        location = reverse_geocode_com_rate_limit(f"{lat}, {lng}")
+        if location:
+            return jsonify({'sucesso': True, 'resultados': [{
+                'nome': location.address,
+                'lat': location.latitude,
+                'lng': location.longitude
+            }]})
+        else:
+            return jsonify({'sucesso': False, 'mensagem': 'Endereço não encontrado para essas coordenadas'})
+    except Exception as e:
+        return jsonify({'sucesso': False, 'mensagem': f'Erro ao fazer reverse geocoding: {str(e)}'})
 
 @app.route('/api/calcular_rota', methods=['POST'])
 def api_calcular_rota():
@@ -418,8 +484,89 @@ def api_pontos_turisticos():
             'mensagem': f'Erro ao buscar pontos turísticos: {str(e)}'
         })
 
+# Configuração OSRM (público por padrão; pode ser sobrescrito via env OSRM_URL)
+OSRM_BASE_URL = os.environ.get('OSRM_URL', 'https://router.project-osrm.org')
+
+def chamar_osrm_route(profile, waypoints):
+    try:
+        if not waypoints or len(waypoints) < 2:
+            return {'sucesso': False, 'mensagem': 'Waypoints insuficientes'}
+        if len(waypoints) > 7:
+            return {'sucesso': False, 'mensagem': 'Limite excedido: máximo origem + 5 paradas + destino'}
+        coords = ';'.join([f"{wp[1]},{wp[0]}" for wp in waypoints])
+        url = f"{OSRM_BASE_URL}/route/v1/{profile}/{coords}?overview=full&geometries=geojson&steps=false"
+        req = urllib.request.Request(url, headers={'User-Agent': 'RotaMarcio/1.0'})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        if 'routes' not in data or not data['routes']:
+            return {'sucesso': False, 'mensagem': 'OSRM não retornou rotas'}
+        r0 = data['routes'][0]
+        return {
+            'sucesso': True,
+            'distance_m': r0.get('distance'),
+            'duration_s': r0.get('duration'),
+            'geometry_geojson': r0.get('geometry')
+        }
+    except urllib.error.URLError as e:
+        return {'sucesso': False, 'mensagem': f'Erro de rede ao chamar OSRM: {e}'}
+    except Exception as e:
+        return {'sucesso': False, 'mensagem': f'Erro ao processar resposta OSRM: {str(e)}'}
+
+@app.route('/api/rota_osrm', methods=['POST'])
+def api_rota_osrm():
+    try:
+        dados = request.json or {}
+        profile = dados.get('profile', 'driving')
+        waypoints = dados.get('waypoints')
+        if not isinstance(waypoints, list):
+            return jsonify({'sucesso': False, 'mensagem': 'Parâmetro waypoints inválido'})
+        wps = []
+        for wp in waypoints:
+            if not isinstance(wp, (list, tuple)) or len(wp) != 2:
+                return jsonify({'sucesso': False, 'mensagem': 'Waypoint inválido'})
+            wps.append([float(wp[0]), float(wp[1])])
+        resultado = chamar_osrm_route(profile, wps)
+        return jsonify(resultado)
+    except Exception as e:
+        import traceback
+        print(f"Erro na API rota_osrm: {traceback.format_exc()}")
+        return jsonify({'sucesso': False, 'mensagem': f'Erro ao calcular rota OSRM: {str(e)}'})
+
+@app.route('/api/desvio_parada', methods=['POST'])
+def api_desvio_parada():
+    try:
+        dados = request.json or {}
+        profile = dados.get('profile', 'driving')
+        base = dados.get('base')
+        candidate = dados.get('candidate')
+        if not isinstance(base, list) or len(base) < 2:
+            return jsonify({'sucesso': False, 'mensagem': 'Rota base inválida'})
+        if not isinstance(candidate, (list, tuple)) or len(candidate) != 2:
+            return jsonify({'sucesso': False, 'mensagem': 'Candidato inválido'})
+        base_norm = [[float(wp[0]), float(wp[1])] for wp in base]
+        res_base = chamar_osrm_route(profile, base_norm)
+        if not res_base.get('sucesso'):
+            return jsonify({'sucesso': False, 'mensagem': res_base.get('mensagem', 'Falha ao calcular base')})
+        with_candidate = base_norm[:-1] + [[float(candidate[0]), float(candidate[1])]] + [base_norm[-1]]
+        if len(with_candidate) > 7:
+            return jsonify({'sucesso': False, 'mensagem': 'Limite excedido ao adicionar parada'})
+        res_cand = chamar_osrm_route(profile, with_candidate)
+        if not res_cand.get('sucesso'):
+            return jsonify({'sucesso': False, 'mensagem': res_cand.get('mensagem', 'Falha ao calcular com parada')})
+        delta_dist = (res_cand.get('distance_m') or 0) - (res_base.get('distance_m') or 0)
+        delta_dur = (res_cand.get('duration_s') or 0) - (res_base.get('duration_s') or 0)
+        return jsonify({
+            'sucesso': True,
+            'delta_distance_m': delta_dist,
+            'delta_duration_s': delta_dur,
+            'preview_geometry_geojson': res_cand.get('geometry_geojson')
+        })
+    except Exception as e:
+        import traceback
+        print(f"Erro na API desvio_parada: {traceback.format_exc()}")
+        return jsonify({'sucesso': False, 'mensagem': f'Erro ao calcular desvio: {str(e)}'})
+
 if __name__ == '__main__':
-    # Inicializar o sistema
     if inicializar_sistema():
         print("🚀 Iniciando servidor Flask...")
         app.run(debug=True, host='0.0.0.0', port=5000)
